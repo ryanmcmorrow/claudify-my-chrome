@@ -5,8 +5,8 @@
  * then merges the Hanzi MCP server entry into each agent's config file.
  */
 import { existsSync, readFileSync, writeFileSync, mkdirSync, copyFileSync, readdirSync } from 'fs';
-import { join, dirname } from 'path';
-import { fileURLToPath } from 'url';
+import { discoverBundledSkills as discoverSkills } from './skills-discovery.js';
+import { join } from 'path';
 import { homedir, platform } from 'os';
 import { execSync } from 'child_process';
 import { createInterface } from 'readline';
@@ -14,6 +14,7 @@ import { randomUUID } from 'crypto';
 import { isRelayRunning } from '../relay/auto-start.js';
 import { WebSocketClient } from '../ipc/websocket-client.js';
 import { detectCredentialSources as detectSources, checkCredentialFlowResult, } from './detect-credentials.js';
+import { MANAGED_DASHBOARD_URL } from './managed-client.js';
 import { initTelemetry, trackEvent, shutdownTelemetry } from '../telemetry.js';
 // ── Style ──────────────────────────────────────────────────────────────
 const c = {
@@ -72,9 +73,10 @@ export function getAgentRegistry(deps = {}) {
     const xdgConfigHome = deps.xdgConfigHome ?? process.env.XDG_CONFIG_HOME ?? join(home, '.config');
     const pathExists = deps.pathExists ?? existsSync;
     const runCommand = deps.runCommand ?? execSync;
+    const lookupCmd = plat === 'win32' ? 'where' : 'which';
     const hasCli = (bin) => {
         try {
-            runCommand(`which ${bin}`, { stdio: 'ignore' });
+            runCommand(`${lookupCmd} ${bin}`, { stdio: 'ignore' });
             return true;
         }
         catch {
@@ -306,6 +308,10 @@ function runClaudeCodeSetup() {
 }
 // ── Browser detection ──────────────────────────────────────────────────
 const EXTENSION_URL = 'https://chromewebstore.google.com/detail/hanzi-browse/iklpkemlmbhemkiojndpbhoakgikpmcd';
+// Per-user Chromium installs land under %LOCALAPPDATA% — a user without admin
+// rights on Windows can only install browsers this way, so omitting these
+// paths makes setup report "No Chromium browser found" on locked-down laptops.
+const WIN_LOCAL_APP_DATA = process.env.LOCALAPPDATA ?? join(homedir(), 'AppData', 'Local');
 const BROWSERS = [
     {
         name: 'Google Chrome',
@@ -315,6 +321,7 @@ const BROWSERS = [
         winPaths: [
             'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
             'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+            join(WIN_LOCAL_APP_DATA, 'Google', 'Chrome', 'Application', 'chrome.exe'),
         ],
     },
     {
@@ -325,6 +332,7 @@ const BROWSERS = [
         winPaths: [
             'C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe',
             'C:\\Program Files (x86)\\BraveSoftware\\Brave-Browser\\Application\\brave.exe',
+            join(WIN_LOCAL_APP_DATA, 'BraveSoftware', 'Brave-Browser', 'Application', 'brave.exe'),
         ],
     },
     {
@@ -352,6 +360,7 @@ const BROWSERS = [
         winPaths: [
             'C:\\Program Files\\Chromium\\Application\\chrome.exe',
             'C:\\Program Files (x86)\\Chromium\\Application\\chrome.exe',
+            join(WIN_LOCAL_APP_DATA, 'Chromium', 'Application', 'chrome.exe'),
         ],
     },
 ];
@@ -552,7 +561,6 @@ async function promptAccessMode(isInteractive) {
     return 'byom'; // default for '1' or anything else
 }
 // ── Managed access ──────────────────────────────────────────────────
-const MANAGED_DASHBOARD_URL = 'https://api.hanzilla.co/dashboard';
 const MANAGED_SIGNIN_URL = 'https://api.hanzilla.co/api/auth/sign-in/social';
 let managedApiKey = null;
 async function handleManagedAccess() {
@@ -581,6 +589,11 @@ async function handleManagedAccess() {
         if (res.ok && data.free_remaining !== undefined) {
             managedApiKey = trimmed;
             console.log(`\n  ${c.green('✓')}  Key validated! ${data.free_remaining} free tasks + ${data.credit_balance || 0} credits available.`);
+            if (data.free_remaining <= 3 && (data.credit_balance || 0) === 0) {
+                console.log(`  ${c.yellow('●')}  Low balance: ${data.free_remaining}/${data.free_tasks_per_month} free tasks remaining, no paid credits.`);
+                console.log(`     Add credits at ${c.cyan(MANAGED_DASHBOARD_URL)} before heavy use.`);
+            }
+            await attemptManagedPair(trimmed);
         }
         else {
             console.log(`\n  ${c.red('✗')}  Invalid key: ${data.error || 'authentication failed'}`);
@@ -590,14 +603,48 @@ async function handleManagedAccess() {
     catch (err) {
         console.log(`\n  ${c.yellow('●')}  Could not validate key (network error). Saving anyway.`);
         managedApiKey = trimmed;
+        await attemptManagedPair(trimmed);
+    }
+}
+async function attemptManagedPair(apiKey, isInteractive = true) {
+    if (isInteractive) {
+        console.log('');
+    }
+    const sp = spinner('Pairing extension with your managed workspace...', isInteractive);
+    try {
+        const { createPairingToken } = await import('./managed-client.js');
+        const pairing = await createPairingToken({ apiKey, apiUrl: process.env.HANZI_API_URL });
+        const connected = await connectRelay();
+        if (!connected) {
+            sp.stop(`${c.yellow('●')}  Extension not reachable via local relay. Open Chrome with the extension, then re-run setup.`);
+            return;
+        }
+        const requestId = randomUUID().slice(0, 8);
+        const done = waitForRelayResponse('mcp_managed_pair_response', requestId, 10000);
+        await relay.send({
+            type: 'mcp_managed_pair',
+            requestId,
+            payload: {
+                pairing_token: pairing.pairing_token,
+                api_url: process.env.HANZI_API_URL || 'https://api.hanzilla.co',
+                requestId,
+            },
+        });
+        const response = await done;
+        if (response?.success) {
+            sp.stop(`${c.green('✓')}  Extension paired with managed workspace (browser_session_id: ${String(response.browser_session_id).slice(0, 12)}…)`);
+        }
+        else {
+            sp.stop(`${c.yellow('●')}  Pairing failed: ${response?.error || 'no response from extension'}`);
+        }
+    }
+    catch (err) {
+        sp.stop(`${c.yellow('●')}  Could not pair extension: ${err.message}`);
     }
 }
 function openUrl(url) {
     try {
-        const cmd = platform() === 'darwin' ? `open "${url}"`
-            : platform() === 'win32' ? `start "${url}"`
-                : `xdg-open "${url}"`;
-        execSync(cmd, { stdio: 'ignore' });
+        execSync(buildSystemOpenCommand(url, platform()), { stdio: 'ignore' });
     }
     catch { }
 }
@@ -753,65 +800,30 @@ function disconnectRelay() {
         setTimeout(() => { console.error = origError; }, 500);
     }
 }
-const VALID_CATEGORIES = ['core', 'productivity', 'marketing', 'life'];
+function waitForRelayResponse(expectedType, requestId, timeoutMs) {
+    return new Promise((resolve) => {
+        if (!relay)
+            return resolve(null);
+        const timer = setTimeout(() => {
+            relay?.offMessage(onMsg);
+            resolve(null);
+        }, timeoutMs);
+        const onMsg = (msg) => {
+            if (msg.type === expectedType && msg.requestId === requestId) {
+                clearTimeout(timer);
+                relay?.offMessage(onMsg);
+                resolve(msg);
+            }
+        };
+        relay.onMessage(onMsg);
+    });
+}
+// ── Skill installation ──────────────────────────────────────────────────
 const CATEGORY_BUNDLES = [
     { cat: 'productivity', label: 'Productivity', summary: 'testing, audits, data extraction, SEO' },
     { cat: 'marketing', label: 'Marketing & growth', summary: 'social posting, prospecting, competitor research' },
     { cat: 'life', label: 'Personal automation', summary: 'apartments, jobs' },
 ];
-function getSkillsSource() {
-    // Skills are bundled in the npm package at ../skills/ relative to dist/cli/
-    const fromDist = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'skills');
-    if (existsSync(fromDist))
-        return fromDist;
-    // Fallback: running from source at src/cli/
-    const fromSrc = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'skills');
-    return fromSrc;
-}
-function parseSkillFrontmatter(content) {
-    const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
-    if (!match)
-        return null;
-    const result = {};
-    for (const line of match[1].split(/\r?\n/)) {
-        const m = line.match(/^(\w+):\s*(.*)$/);
-        if (!m)
-            continue;
-        const key = m[1];
-        const value = m[2].trim();
-        if (key === 'description')
-            result.description = value;
-        else if (key === 'category' && VALID_CATEGORIES.includes(value)) {
-            result.category = value;
-        }
-    }
-    return result;
-}
-function discoverSkills(skillsSource) {
-    if (!existsSync(skillsSource))
-        return [];
-    const skills = [];
-    for (const entry of readdirSync(skillsSource, { withFileTypes: true })) {
-        if (!entry.isDirectory())
-            continue;
-        const skillPath = join(skillsSource, entry.name);
-        const skillMd = join(skillPath, 'SKILL.md');
-        if (!existsSync(skillMd))
-            continue;
-        const meta = parseSkillFrontmatter(readFileSync(skillMd, 'utf-8'));
-        if (!meta)
-            continue;
-        skills.push({
-            name: entry.name,
-            description: meta.description || '',
-            // Skills without an explicit category default to productivity — a safe
-            // "opt-in bundle" rather than forcing everyone to get it by default.
-            category: meta.category ?? 'productivity',
-            path: skillPath,
-        });
-    }
-    return skills;
-}
 async function promptSkillCategories(skills) {
     const selected = new Set();
     const coreSkills = skills.filter(s => s.category === 'core');
@@ -868,8 +880,7 @@ async function promptSkillCategories(skills) {
     return selected;
 }
 async function installSkills(agents, isInteractive, options = {}) {
-    const skillsSource = getSkillsSource();
-    const discovered = discoverSkills(skillsSource);
+    const discovered = discoverSkills();
     if (discovered.length === 0)
         return;
     const agentsWithSkills = agents.filter(a => a.skillsDir);
@@ -1090,7 +1101,42 @@ export async function runSetup(options = {}) {
     await installSkills(detected, interactive, { all: options.all, skills: options.skills });
     // ── Step 3: Access mode ──
     let accessMode = 'byom';
-    if (interactive) {
+    if (options.managed && options.apiKey) {
+        // Non-interactive managed mode with pre-supplied key
+        accessMode = 'managed';
+        log('\n  Step 3: Managed mode (--managed --api-key)');
+        try {
+            const res = await fetch(`https://api.hanzilla.co/v1/billing/credits`, {
+                headers: { Authorization: `Bearer ${options.apiKey}` },
+            });
+            const data = await res.json();
+            if (res.ok && data.free_remaining !== undefined) {
+                managedApiKey = options.apiKey;
+                log(`  ✓  Managed key validated (${data.free_remaining} free tasks remaining)`);
+                if (data.free_remaining <= 3 && (data.credit_balance || 0) === 0) {
+                    log(`  ●  Low balance: ${data.free_remaining}/${data.free_tasks_per_month} free tasks remaining, no paid credits.`);
+                    log(`     Add credits at ${MANAGED_DASHBOARD_URL} before heavy use.`);
+                }
+            }
+            else {
+                log(`  ✗  Invalid API key: ${data.error || 'authentication failed'}`);
+                trackEvent("setup_failed", { error_category: "invalid_api_key" });
+                await shutdownTelemetry();
+                rl?.close();
+                setTimeout(() => process.exit(0), 200);
+                return;
+            }
+        }
+        catch (err) {
+            log(`  ●  Could not validate key (network error): ${err.message}. Proceeding.`);
+            managedApiKey = options.apiKey;
+        }
+        if (managedApiKey) {
+            await injectManagedKey(managedApiKey, detected);
+            await attemptManagedPair(managedApiKey, interactive);
+        }
+    }
+    else if (interactive) {
         accessMode = await promptAccessMode(interactive);
         if (accessMode === 'byom') {
             await promptByomCredentials();
@@ -1160,7 +1206,11 @@ export async function runSetup(options = {}) {
         log('\n  Setup complete!');
         if (configured > 0)
             log(`     Restart your agents to pick up the new MCP config.`);
-        if (hasCreds) {
+        if (accessMode === 'managed' && managedApiKey) {
+            log('     Managed mode configured — 20 free tasks/month.');
+            log('\n  Try it: ask your agent "Go to Hacker News and tell me the top 3 stories"');
+        }
+        else if (hasCreds) {
             log('     Credentials detected — Hanzi is ready to use.');
             log('\n  Try it: ask your agent "Go to Hacker News and tell me the top 3 stories"');
         }

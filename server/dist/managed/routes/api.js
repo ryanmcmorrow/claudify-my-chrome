@@ -13,7 +13,14 @@ export async function handleSessionRoutes(ctx) {
         const body = await parseBody(req);
         const label = typeof body.label === "string" ? body.label.slice(0, 200) : undefined;
         const externalUserId = typeof body.external_user_id === "string" ? body.external_user_id.slice(0, 200) : undefined;
-        const token = await S.createPairingToken(apiKey.workspaceId, apiKey.id, { label, externalUserId });
+        // `source` is ALWAYS set by the server based on auth context — never from
+        // the request body — so partners can't spoof "self" or "dashboard". Cookie
+        // auth (dashboard) returns an ApiKey with name === "session" (see
+        // authenticate() in api.ts); real API keys have a user-supplied name.
+        // Internal routes like /pair-self pass explicit sources via direct store
+        // calls and never hit this handler.
+        const source = apiKey.name === "session" ? "dashboard" : "partner";
+        const token = await S.createPairingToken(apiKey.workspaceId, apiKey.id, { label, externalUserId, source });
         trackManagedEvent("pairing_link_generated", apiKey.workspaceId);
         sendJson(req, res, 201, {
             pairing_token: token._plainToken,
@@ -32,6 +39,7 @@ export async function handleSessionRoutes(ctx) {
                 last_heartbeat: s.lastHeartbeat,
                 label: s.label || null,
                 external_user_id: s.externalUserId || null,
+                source: s.source ?? "partner",
             })),
         });
         return true;

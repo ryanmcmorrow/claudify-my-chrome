@@ -63,5 +63,7 @@ export declare function runSetup(options?: {
     yes?: boolean;
     all?: boolean;
     skills?: string[];
+    managed?: boolean;
+    apiKey?: string;
 }): Promise<void>;
 export {};

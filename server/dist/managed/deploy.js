@@ -18,9 +18,7 @@ import { randomUUID } from "crypto";
 import { initVertex } from "../llm/vertex.js";
 import { getClaudeCredentials, getClaudeKeychainCredentials, getCodexCredentials } from "../llm/credentials.js";
 import { handleApiProxy } from "../relay/api-proxy.js";
-import { startManagedAPI, initManagedAPI, handleRelayMessage, setStoreModule, onSessionDisconnected, shutdownManagedAPI, recoverStuckTasks, runInternalTask } from "./api.js";
-import { initScheduler, startScheduler, stopScheduler } from "./scheduler.js";
-import { notifyDraftsReady } from "./notify.js";
+import { startManagedAPI, initManagedAPI, handleRelayMessage, setStoreModule, onSessionDisconnected, shutdownManagedAPI, recoverStuckTasks } from "./api.js";
 import { initBilling, setBillingStore } from "./billing.js";
 import { WebSocketClient } from "../ipc/websocket-client.js";
 import { initManagedTelemetry, shutdownManagedTelemetry } from "./telemetry.js";
@@ -456,17 +454,6 @@ async function main() {
     store.startHeartbeatFlush();
     // 7. Recover tasks stuck in "running" from a previous process
     await recoverStuckTasks();
-    // 8. Start scheduler for automated tasks
-    if (DATABASE_URL) {
-        const pgStore = await import("./store-pg.js");
-        initScheduler({
-            store: pgStore,
-            runTask: runInternalTask,
-            isSessionConnected: isSessionConnected,
-            notify: notifyDraftsReady,
-        });
-        startScheduler();
-    }
     console.error(`
 ╔════════════════════════════════════════════════╗
 ║  Hanzi Managed Backend (deployed)              ║
@@ -489,7 +476,6 @@ main().catch((err) => {
 async function handleShutdown(signal) {
     console.error(`\n[Server] Received ${signal} — shutting down gracefully...`);
     try {
-        stopScheduler();
         await shutdownManagedAPI();
         await shutdownManagedTelemetry();
     }

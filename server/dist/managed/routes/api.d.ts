@@ -28,12 +28,6 @@ type RouteContext = {
         status: number;
         data: any;
     }>;
-    runInternalTask: (params: {
-        workspaceId: string;
-        browserSessionId: string;
-        task: string;
-        url?: string;
-    }) => Promise<any>;
 };
 /** Browser session routes: /v1/browser-sessions/* */
 export declare function handleSessionRoutes(ctx: RouteContext): Promise<boolean>;
